@@ -1,42 +1,54 @@
-# Use the official Docker Hub Ubuntu base image
-FROM ubuntu:24.04
+# -------- Base: slim, fast, pure-Python worker --------
+FROM python:3.11-slim
 
-# Prevent needing to configure debian packages, stopping the setup of
-# the docker container.
-RUN echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
-
-# Install poetry and any other dependency that your worker needs.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    # Add your dependencies here
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates tzdata curl \
+  && rm -rf /var/lib/apt/lists/*
 
-# Configure debugging
-ARG OPENRELIK_PYDEBUG
-ENV OPENRELIK_PYDEBUG=${OPENRELIK_PYDEBUG:-0}
-ARG OPENRELIK_PYDEBUG_PORT
-ENV OPENRELIK_PYDEBUG_PORT=${OPENRELIK_PYDEBUG_PORT:-5678}
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Set working directory
+# Default for your stack; can still be overridden by compose
+ENV REDIS_URL=redis://openrelik-redis:6379
+
 WORKDIR /openrelik
 
-# Install the latest uv binaries
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY pyproject.toml ./
+RUN python -m pip install --upgrade pip
 
-# Copy poetry toml and install dependencies
-COPY uv.lock pyproject.toml .
+COPY src ./src
+COPY openrelik.yaml ./openrelik.yaml
+RUN pip install .
 
-# Install the project's dependencies using the lockfile and settings
-RUN uv sync --locked --no-install-project --no-dev
+# Optional CLI for local tests
+RUN printf '%s\n' \
+'#!/usr/bin/env python3' \
+'import sys, json, os' \
+'from src.evtx_ip_extract import extract_ips_from_evtx_files' \
+'' \
+'def main():' \
+'    if len(sys.argv) < 3:' \
+'        print("Usage: extract-ips <evtx1> [<evtx2> ...] <out_dir> [include_context=true|false]")' \
+'        sys.exit(1)' \
+'    args = sys.argv[1:]' \
+'    include_context = True' \
+'    if args[-1].lower() in ("true","false"):' \
+'        include_context = (args[-1].lower() == "true")' \
+'        args = args[:-1]' \
+'    out_dir = args[-1]' \
+'    evtx_files = args[:-1]' \
+'    os.makedirs(out_dir, exist_ok=True)' \
+'    res = extract_ips_from_evtx_files(evtx_files, include_context=include_context)' \
+'    with open(os.path.join(out_dir, "unique_ips.json"), "w", encoding="utf-8") as f:' \
+'        json.dump(res.get("unique_ips", []), f, ensure_ascii=False, indent=2)' \
+'    if include_context:' \
+'        with open(os.path.join(out_dir, "ip_hits_with_context.json"), "w", encoding="utf-8") as f:' \
+'            json.dump(res.get("records", []), f, ensure_ascii=False, indent=2, default=str)' \
+'    print(json.dumps({"counts": res.get("counts", {}), "out_dir": out_dir}, indent=2))' \
+'' \
+'if __name__ == "__main__":' \
+'    main()' \
+> /usr/local/bin/extract-ips && chmod +x /usr/local/bin/extract-ips
 
-# Copy project files
-COPY . ./
-
-# Installing separately from its dependencies allows optimal layer caching
-RUN uv sync --locked --no-dev
-
-# Install the worker and set environment to use the correct python interpreter.
-ENV PATH="/openrelik/.venv/bin:$PATH"
-
-# Default command if not run from docker-compose (and command being overidden)
-CMD ["celery", "--app=src.tasks", "worker", "--task-events", "--concurrency=1", "--loglevel=DEBUG"]
+CMD ["celery", "--app=src.app", "worker", "--task-events", "--concurrency=1", "--loglevel=INFO", "-Q", "openrelik-worker-ip-extractor"]

@@ -1,12 +1,38 @@
-# Showcase this worker on https://openrelik.org/marketplace
 publish: false
 
-# Worker Metadata. This section is required.
-display_name: User-friendly name of your worker
-description: Brief description of your workers purpose and functionality.
+display_name: EVTX IP Extractor
+description: |
+  Parses Windows Event Log (.evtx) files and extracts IPv4/IPv6.
+  Optionally returns per-event context (timestamp, channel, provider, event_id, record_id).
 
-# Optional: Third-Party Tools Used by the Worker.
 tools:
-  - display_name: User-friendly name of the tool
-    description: Brief description of the tool
-    url: http://example.com # URL for more info about the tool
+  - display_name: python-evtx
+    description: Parse Windows EVTX files in Python.
+    url: https://github.com/williballenthin/python-evtx
+  - display_name: defusedxml
+    description: Safe XML parsing for event XML.
+    url: https://github.com/tiran/defusedxml
+
+inputs:
+  - name: evtx_files
+    display_name: Windows Event Logs (.evtx)
+    description: One or more .evtx files to scan.
+    type: file
+    extensions: [".evtx"]
+
+outputs:
+  - name: unique_ips
+    display_name: Unique IPs
+    description: Unique IPv4/IPv6 found.
+    type: json
+  - name: records
+    display_name: IP hits with context
+    description: Event metadata per hit (timestamp, channel, provider, event_id, record_id).
+    type: json
+
+task_schema:
+  parameters:
+    include_context:
+      type: boolean
+      default: true
+      description: Include per-event metadata for each IP hit.
