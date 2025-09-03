@@ -1,48 +1,44 @@
-<!--
-README for the OpenRelik Worker Template
+# OpenRelik Worker: IP Extractor (WORK IN PROGRESS)
 
-This file provides instructions on how to use this template to create a new OpenRelik worker.
-The placeholder `ip-extractor` needs to be replaced with the actual name of your worker.
-The `bootstrap.sh` script is designed to help with this process.
--->
-
-1.  **Bootstrap your new worker:**
-    Run the `bash bootstrap.sh` script located in the root of this template. This script will guide you through renaming `ip-extractor` to your chosen worker name throughout the project files (e.g., directory names, Python files, etc.).
-2.  **Update this README:**
-    After bootstrapping, manually replace all remaining instances of `ip-extractor` in this `README.md` file with your actual worker name. Also, fill in the description section below.
-3.  **Write Tests:**
-    Before or alongside developing your worker's core logic, start creating tests.
-    *   **Unit Tests:** Create unit tests for individual functions and classes within your worker's `src` directory. Place these in the `tests/` directory.
-    *   Refer to the "Test" section below for instructions on how to run your tests.
-4.  **Implement Worker Logic:**
-    Fill in the `src/tasks.py` file (and any other necessary modules) with the core functionality of your worker.
-5.  **Add LICENSE file:**
-    Add a License file to the repository.
-
-# Openrelik worker ip-extractor
 ## Description
-**TODO:** Enter a comprehensive description of your worker here. Explain its purpose, what kind of tasks it handles, and any specific functionalities or integrations it provides.
+This worker extracts IPv4 and IPv6 addresses from:
+
+- **Windows Event Logs** (`.evtx` files)  
+  → Parses event records, extracts IPs from fields and text, and can include context such as timestamp, channel, provider, event ID, and record ID.
+
+- **Linux / Text Logs** (`.log`, `.txt`, `syslog`, `auth.log`, `messages`, `secure`, including `.gz`/`.bz2`)  
+  → Scans plain text using regex, detects syslog-like timestamps and common web access log formats, and includes file name, line number, and log kind (syslog/access).
+
+Outputs can include:
+- Unique IPs (`.txt`, `.json`)
+- Full per-record context (`.json`)
+- Optional CSV (Timesketch-friendly)
+- Optional NDJSON (streaming / grep-friendly)
+
+This worker can be used in OpenRelik workflows or as a standalone container for quick log parsing.
+
+---
 
 ## Deploy
-Add the below configuration to the OpenRelik docker-compose.yml file.
 
-```
+Add the following service definition to your `docker-compose.yml` (or Tilt config):
+
+```yaml
 openrelik-worker-ip-extractor:
-    container_name: openrelik-worker-ip-extractor
-    image: ghcr.io/openrelik/openrelik-worker-ip-extractor:latest
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - OPENRELIK_PYDEBUG=0
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-ip-extractor"
-    # ports:
-      # - 5678:5678 # For debugging purposes.
-```
+  container_name: openrelik-worker-ip-extractor
+  image: ghcr.io/openrelik/openrelik-worker-ip-extractor:latest
+  restart: always
+  environment:
+    - REDIS_URL=redis://openrelik-redis:6379
+    - OPENRELIK_PYDEBUG=0
+  depends_on:
+    - openrelik-redis
+  volumes:
+    - ./data:/usr/share/openrelik/data
+  command: >
+    celery --app=src.app worker --task-events --concurrency=4
+    --loglevel=INFO -Q openrelik-worker-ip-extractor
+  # ports:
+  #   - 5678:5678 # For debugging purposes.
 
-## Test
-```
-uv sync --group test
-uv run pytest -s --cov=.
-```
+Once deployed, the worker will register as “IP Extractor (EVTX + Linux logs)” in the OpenRelik UI.
