@@ -1,7 +1,8 @@
 from __future__ import annotations
+import csv
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 # OpenRelik worker common helpers
 from openrelik_worker_common.file_utils import create_output_file
@@ -12,8 +13,9 @@ from openrelik_worker_common.task_utils import create_task_result, get_input_fil
 from .app import celery
 from celery import signals
 
-# Your core logic
+# Core extractors
 from .evtx_ip_extract import extract_ips_from_evtx_files
+from .linux_ip_extract import extract_ips_from_text_files  # <-- NEW
 
 # --------------------------------------------------------------------------------------
 # Task registration
@@ -21,17 +23,18 @@ from .evtx_ip_extract import extract_ips_from_evtx_files
 TASK_NAME = "openrelik-worker-ip-extractor.tasks.extract_ips"
 
 TASK_METADATA = {
-    "display_name": "EVTX IP Extractor",
+    "display_name": "IP Extractor (EVTX + Linux logs)",
     "description": (
-        "Parses Windows Event Logs (.evtx) and extracts IPv4/IPv6 addresses. "
-        "Optionally includes per-event context (timestamp/channel/provider/event_id/record_id)."
+        "Extract IPv4/IPv6 addresses from Windows Event Logs (.evtx) and Linux text logs "
+        "(.log/.txt/syslog/auth.log/messages/secure, including .gz/.bz2). "
+        "Optionally emits per-record context, CSV, and NDJSON."
     ),
     # Rendered as a form in the UI; values arrive in task_config
     "task_config": [
         {
             "name": "include_context",
-            "label": "Include per-event context",
-            "description": "Return detailed records (timestamp, channel, provider, event_id, record_id).",
+            "label": "Include per-record context",
+            "description": "Return detailed records (timestamp/channel/provider/event_id/record_id/source/line_no).",
             "type": "checkbox",
             "required": False,
         },
@@ -43,9 +46,16 @@ TASK_METADATA = {
             "required": False,
         },
         {
+            "name": "include_linux_logs",
+            "label": "Scan Linux text logs (.log/.gz/.bz2/syslog/auth.log/messages/secure)",
+            "description": "Also parse generic text logs for IPs.",
+            "type": "checkbox",
+            "required": False,
+        },
+        {
             "name": "emit_csv",
-            "label": "Also write CSV for Timesketch",
-            "description": "Write a CSV with timestamp,ip,event_id,channel,provider,record_id.",
+            "label": "Also write CSV (Timesketch-friendly)",
+            "description": "Write a CSV with common context columns.",
             "type": "checkbox",
             "required": False,
         },
@@ -65,8 +75,7 @@ logger = log.get_logger(__name__)
 
 @signals.task_prerun.connect
 def on_task_prerun(sender, task_id, task, args, kwargs, **_):
-    log.bind(task_id=task_id, task_name=task.name,
-             worker_name=TASK_METADATA.get("display_name"))
+    log.bind(task_id=task_id, task_name=task.name, worker_name=TASK_METADATA.get("display_name"))
 
 
 @celery.task(bind=True, name=TASK_NAME, metadata=TASK_METADATA)
@@ -79,14 +88,7 @@ def command(
     task_config: dict = None,
 ) -> str:
     """
-    Extract IPs from EVTX files and write outputs.
-
-    Args:
-        pipe_result: Base64-encoded result from a previous task (if any).
-        input_files: Input file dicts (unused when pipe_result exists).
-        output_path: Directory where outputs must be written.
-        workflow_id: OpenRelik workflow ID.
-        task_config: Dict of UI-configured options.
+    Extract IPs from EVTX and (optionally) Linux text logs and write outputs.
 
     Returns:
         Base64-encoded dict via create_task_result.
@@ -98,37 +100,80 @@ def command(
     logger.info(f"Starting {TASK_NAME} for workflow_id={workflow_id}")
 
     cfg = task_config or {}
-    include_context = bool(cfg.get("include_context", True))
-    ignore_private = bool(cfg.get("ignore_private", True))
-    emit_csv = bool(cfg.get("emit_csv", False))
-    emit_ndjson = bool(cfg.get("emit_ndjson", False))
+    include_context: bool = bool(cfg.get("include_context", True))
+    ignore_private: bool = bool(cfg.get("ignore_private", True))
+    include_linux_logs: bool = bool(cfg.get("include_linux_logs", True))
+    emit_csv: bool = bool(cfg.get("emit_csv", False))
+    emit_ndjson: bool = bool(cfg.get("emit_ndjson", False))
 
     # Collect input files (from previous pipe or from UI-provided inputs)
     files = get_input_files(pipe_result, input_files or [])
+
     evtx_paths: List[str] = []
+    text_paths: List[str] = []
+
+    # Common Linux log basenames (no extension)
+    linux_names = {"syslog", "auth.log", "messages", "secure"}
+
     for f in files:
         p = f.get("path")
-        if p and p.lower().endswith(".evtx") and os.path.isfile(p):
+        if not p or not os.path.isfile(p):
+            continue
+        lp = p.lower()
+        if lp.endswith(".evtx"):
             evtx_paths.append(p)
+        elif include_linux_logs:
+            if lp.endswith((".log", ".txt", ".gz", ".bz2")) or os.path.basename(lp) in linux_names:
+                text_paths.append(p)
 
-    if not evtx_paths:
-        raise RuntimeError("No .evtx input files found for EVTX IP extraction.")
+    if not evtx_paths and not text_paths:
+        raise RuntimeError(
+            "No supported input files found. "
+            "Accepted: .evtx, .log, .txt, .gz, .bz2, or syslog/auth.log/messages/secure."
+        )
 
     # ------------------------------------------------------------
-    # Extract
+    # Extract from EVTX and Linux logs
     # ------------------------------------------------------------
-    result = extract_ips_from_evtx_files(
-        evtx_paths=evtx_paths,
-        include_context=include_context,
-        ignore_private=ignore_private,
-        ignore_link_local=True,
-        ignore_reserved=False,
-        ignore_loopback=True,
-        ignore_multicast=True,
-    )
+    combined_unique = set()
+    combined_records: List[Dict] = []
+    counts = {"evtx_unique": 0, "linux_unique": 0, "evtx_records": 0, "linux_records": 0}
 
-    unique_ips = result.get("unique_ips", [])
-    records = result.get("records", [])
+    if evtx_paths:
+        evtx_res = extract_ips_from_evtx_files(
+            evtx_paths=evtx_paths,
+            include_context=include_context,
+            ignore_private=ignore_private,
+            ignore_link_local=True,
+            ignore_reserved=False,
+            ignore_loopback=True,
+            ignore_multicast=True,
+        )
+        evtx_unique = set(evtx_res.get("unique_ips", []))
+        combined_unique |= evtx_unique
+        if include_context:
+            combined_records.extend(evtx_res.get("records", []))
+        counts["evtx_unique"] = len(evtx_unique)
+        counts["evtx_records"] = len(evtx_res.get("records", [])) if include_context else 0
+
+    if text_paths:
+        text_res = extract_ips_from_text_files(
+            log_paths=text_paths,
+            include_context=include_context,
+            ignore_private=ignore_private,
+            ignore_link_local=True,
+            ignore_reserved=False,
+            ignore_loopback=True,
+            ignore_multicast=True,
+        )
+        text_unique = set(text_res.get("unique_ips", []))
+        combined_unique |= text_unique
+        if include_context:
+            combined_records.extend(text_res.get("records", []))
+        counts["linux_unique"] = len(text_unique)
+        counts["linux_records"] = len(text_res.get("records", [])) if include_context else 0
+
+    unique_ips = sorted(combined_unique)
 
     # ------------------------------------------------------------
     # Write outputs
@@ -137,10 +182,7 @@ def command(
 
     # 1) unique IPs (txt + json)
     uniq_txt = create_output_file(
-        output_path,
-        display_name="unique_ips",
-        extension="txt",
-        data_type="ip-list",
+        output_path, display_name="unique_ips", extension="txt", data_type="ip-list"
     )
     with open(uniq_txt.path, "w", encoding="utf-8") as fh:
         for ip in unique_ips:
@@ -148,10 +190,7 @@ def command(
     output_files.append(uniq_txt.to_dict())
 
     uniq_json = create_output_file(
-        output_path,
-        display_name="unique_ips",
-        extension="json",
-        data_type="json",
+        output_path, display_name="unique_ips", extension="json", data_type="json"
     )
     with open(uniq_json.path, "w", encoding="utf-8") as fh:
         json.dump(unique_ips, fh, ensure_ascii=False, indent=2)
@@ -160,36 +199,27 @@ def command(
     # 2) records (json) if context was requested
     if include_context:
         hits_json = create_output_file(
-            output_path,
-            display_name="ip_hits_with_context",
-            extension="json",
-            data_type="json",
+            output_path, display_name="ip_hits_with_context", extension="json", data_type="json"
         )
         with open(hits_json.path, "w", encoding="utf-8") as fh:
-            json.dump(records, fh, ensure_ascii=False, indent=2, default=str)
+            json.dump(combined_records, fh, ensure_ascii=False, indent=2, default=str)
         output_files.append(hits_json.to_dict())
 
         # Optional CSV (Timesketch-friendly)
         if emit_csv:
             hits_csv = create_output_file(
-                output_path,
-                display_name="ip_hits_with_context",
-                extension="csv",
-                data_type="csv",
+                output_path, display_name="ip_hits_with_context", extension="csv", data_type="csv"
             )
-            _write_records_csv(hits_csv.path, records)
+            _write_records_csv(hits_csv.path, combined_records)
             output_files.append(hits_csv.to_dict())
 
         # Optional NDJSON
         if emit_ndjson:
             hits_ndjson = create_output_file(
-                output_path,
-                display_name="ip_hits_with_context",
-                extension="ndjson",
-                data_type="jsonl",
+                output_path, display_name="ip_hits_with_context", extension="ndjson", data_type="jsonl"
             )
             with open(hits_ndjson.path, "w", encoding="utf-8") as fh:
-                for rec in records:
+                for rec in combined_records:
                     fh.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
             output_files.append(hits_ndjson.to_dict())
 
@@ -197,14 +227,13 @@ def command(
     # Finalize
     # ------------------------------------------------------------
     if not output_files:
-        raise RuntimeError("No output files were produced by EVTX IP Extractor.")
+        raise RuntimeError("No output files were produced by IP Extractor.")
 
-    # This string is informational in the UI
-    command_string = "evtx_ip_extract (Python) on {} file(s)".format(len(evtx_paths))
+    command_string = f"ip_extractor (Python) on EVTX:{len(evtx_paths)} Linux:{len(text_paths)}"
 
     logger.info(
-        "Completed EVTX IP extraction",
-        extra={"unique_count": len(unique_ips), "records": len(records)},
+        "Completed IP extraction",
+        extra={"unique_count": len(unique_ips), "records": len(combined_records)},
     )
 
     return create_task_result(
@@ -212,10 +241,15 @@ def command(
         workflow_id=workflow_id,
         command=command_string,
         meta={
-            "counts": result.get("counts", {}),
-            "evtx_files_processed": len(evtx_paths),
+            "counts": {
+                **counts,
+                "total_unique": len(unique_ips),
+                "total_records": len(combined_records) if include_context else 0,
+            },
+            "files_processed": {"evtx": len(evtx_paths), "linux": len(text_paths)},
             "include_context": include_context,
             "ignore_private": ignore_private,
+            "include_linux_logs": include_linux_logs,
         },
     )
 
@@ -224,10 +258,21 @@ def command(
 # Helpers
 # --------------------------------------------------------------------------------------
 def _write_records_csv(path: str, records: List[Dict]) -> None:
-    """Write a simple CSV for Timesketch ingestion."""
-    import csv
-
-    headers = ["timestamp", "ip", "event_id", "channel", "provider", "record_id"]
+    """
+    Write a CSV that accommodates both EVTX and Linux-text records.
+    Columns not applicable to a given record will be empty.
+    """
+    headers = [
+        "timestamp",       # EVTX: created | Linux: created (parsed or raw)
+        "ip",
+        "event_id",        # EVTX only
+        "channel",         # EVTX only
+        "provider",        # EVTX only
+        "record_id",       # EVTX only (event_record_id)
+        "source",          # Linux only (file path)
+        "line_no",         # Linux only (line number)
+        "kind",            # Linux only (syslog/access)
+    ]
     with open(path, "w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(headers)
@@ -239,4 +284,7 @@ def _write_records_csv(path: str, records: List[Dict]) -> None:
                 r.get("channel") or "",
                 r.get("provider") or "",
                 r.get("event_record_id") or "",
+                r.get("source") or "",
+                r.get("line_no") or "",
+                r.get("kind") or "",
             ])
